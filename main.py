@@ -4,6 +4,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 
 from db import get_db
 from models import Course, Enrollment, Student
@@ -26,6 +27,41 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+CONSTRAINT_ERRORS = {
+    "students_email_key": (
+        409,
+        "Student with this email already exists",
+    ),
+    "enrollments_course_id_student_id_key": (
+        409,
+        "Student is already enrolled in this course",
+    ),
+    "enrollments_course_id_fkey": (
+        404,
+        "Course not found",
+    ),
+    "enrollments_student_id_fkey": (
+        404,
+        "Student not found",
+    ),
+}
+
+
+def raise_http_error(exc: IntegrityError):
+    constraint_name = exc.orig.diag.constraint_name
+
+    error = CONSTRAINT_ERRORS.get(constraint_name)
+
+    if error is None:
+        raise exc
+
+    status_code, detail = error
+
+    raise HTTPException(
+        status_code=status_code,
+        detail=detail,
+    )
 
 
 SessionDep = Annotated[Session, Depends(get_db)]
@@ -113,7 +149,11 @@ def create_student(data: StudentIn, db: SessionDep):
     )
 
     db.add(student)
-    db.commit()
+    
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        raise_http_error(exc)
 
     return student
 
@@ -126,7 +166,12 @@ def create_enrollment(data: EnrollmentIn, db: SessionDep):
     )
 
     db.add(enrollment)
-    db.commit()
+    
+    
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        raise_http_error(exc)
 
     return enrollment
 
