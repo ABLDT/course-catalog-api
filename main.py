@@ -83,6 +83,7 @@ def read_root():
 def list_courses(
     db: SessionDep,
     is_elective: bool | None = None,
+    level: str | None = None,
     sort: str = "popular",
     p: dict = Depends(pagination),
 ):
@@ -93,12 +94,17 @@ def list_courses(
             Course.is_elective == is_elective
         )
 
+    if level is not None:
+        stmt = stmt.where(
+            Course.level == level
+        )
+
     if sort == "title":
         stmt = stmt.order_by(Course.title)
     else:
         stmt = stmt.order_by(
             Course.likes.desc(),
-            Course.id
+            Course.id,
         )
 
     stmt = stmt.limit(p["limit"]).offset(p["offset"])
