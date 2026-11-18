@@ -1,12 +1,15 @@
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
-from sqlalchemy import func, select, update
-from sqlalchemy.exc import IntegrityError
 
+import counter
+import problem
+import services
 from db import get_db
+from graphql_api import graphql_app
 from models import Course, Enrollment, Student
 from schemas import (
     CourseOut,
@@ -20,63 +23,33 @@ from schemas import (
 
 
 app = FastAPI(title="Course Catalog API")
+problem.install(app)
+counter.install(app)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-CONSTRAINT_ERRORS = {
-    "students_email_key": (
-        409,
-        "Student with this email already exists",
-    ),
-    "enrollments_course_id_student_id_key": (
-        409,
-        "Student is already enrolled in this course",
-    ),
-    "enrollments_course_id_fkey": (
-        404,
-        "Course not found",
-    ),
-    "enrollments_student_id_fkey": (
-        404,
-        "Student not found",
-    ),
-}
-
-
-def raise_http_error(exc: IntegrityError):
-    constraint_name = exc.orig.diag.constraint_name
-
-    error = CONSTRAINT_ERRORS.get(constraint_name)
-
-    if error is None:
-        raise exc
-
-    status_code, detail = error
-
-    raise HTTPException(
-        status_code=status_code,
-        detail=detail,
-    )
-
-
 SessionDep = Annotated[Session, Depends(get_db)]
-
-
-def pagination(page: int = 1, page_size: int = 20):
-    return {
-        "offset": (page - 1) * page_size,
-        "limit": page_size,
-    }
+app.include_router(graphql_app, prefix="/graphql")
 
 
 @app.get("/")
-def read_root():
+def root():
     return {"message": "Course Catalog API is running"}
+
+
+def pagination(page: int = 1, page_size: int = 20) -> dict[str, int]:
+    page = max(page, 1)
+    page_size = min(max(page_size, 1), 100)
+    return {
+        "limit": page_size,
+        "offset": (page - 1) * page_size,
+    }
 
 
 @app.get("/courses", response_model=list[CourseOut])
@@ -84,120 +57,85 @@ def list_courses(
     db: SessionDep,
     is_elective: bool | None = None,
     level: str | None = None,
-    sort: str = "popular",
-    p: dict = Depends(pagination),
+    sort: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
 ):
+    p = pagination(page, page_size)
     stmt = select(Course)
 
     if is_elective is not None:
-        stmt = stmt.where(
-            Course.is_elective == is_elective
-        )
-
+        stmt = stmt.where(Course.is_elective == is_elective)
     if level is not None:
-        stmt = stmt.where(
-            Course.level == level
-        )
+        stmt = stmt.where(Course.level == level)
 
     if sort == "title":
-        stmt = stmt.order_by(Course.title)
+        stmt = stmt.order_by(Course.title, Course.id)
     else:
-        stmt = stmt.order_by(
-            Course.likes.desc(),
-            Course.id,
-        )
+        stmt = stmt.order_by(Course.likes.desc(), Course.id)
 
     stmt = stmt.limit(p["limit"]).offset(p["offset"])
-
     return db.scalars(stmt).all()
 
 
 @app.get("/courses/{course_id}", response_model=CourseOut)
 def get_course(course_id: str, db: SessionDep):
     course = db.get(Course, course_id)
-
     if course is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Course not found"
-        )
-
+        raise services.ServiceError("COURSE_NOT_FOUND", "Course not found")
     return course
 
 
 @app.post("/courses/{course_id}/like", response_model=CourseOut)
 def like_course(course_id: str, db: SessionDep):
-    stmt = (
-        update(Course)
-        .where(Course.id == course_id)
-        .values(likes=Course.likes + 1)
-        .returning(Course)
-    )
-
-    course = db.scalars(stmt).one_or_none()
-
-    if course is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Course not found"
-        )
-
-    db.commit()
-
-    return course
+    return services.like_course(db, course_id)
 
 
 @app.post("/students", response_model=StudentOut, status_code=201)
 def create_student(data: StudentIn, db: SessionDep):
-    student = Student(
-        name=data.name,
-        email=data.email,
-    )
-
-    db.add(student)
-    
-    try:
-        db.commit()
-    except IntegrityError as exc:
-        raise_http_error(exc)
-
-    return student
+    return services.create_student(db, data.name, str(data.email))
 
 
 @app.post("/enrollments", response_model=EnrollmentOut, status_code=201)
 def create_enrollment(data: EnrollmentIn, db: SessionDep):
-    enrollment = Enrollment(
-        course_id=data.course_id,
-        student_id=data.student_id,
-    )
-
-    db.add(enrollment)
-    
-    
-    try:
-        db.commit()
-    except IntegrityError as exc:
-        raise_http_error(exc)
-
-    return enrollment
+    return services.enroll(db, data.course_id, data.student_id)
 
 
-@app.get("/enrollments", response_model=list[EnrollmentDetail])
-def list_enrollments(db: SessionDep):
-    stmt = (
+def enrollment_details():
+    return (
         select(
             Enrollment.id,
             Enrollment.course_id,
-            Course.title.label("course_title"),
             Enrollment.student_id,
-            Student.name.label("student_name"),
             Enrollment.enrolled_at,
+            Course.title.label("course_title"),
+            Student.name.label("student_name"),
         )
         .join(Enrollment.course)
         .join(Enrollment.student)
         .order_by(Enrollment.id)
     )
 
+
+@app.get("/enrollments", response_model=list[EnrollmentDetail])
+def list_enrollments(db: SessionDep):
+    return db.execute(enrollment_details()).all()
+
+
+@app.get("/students/{student_id}", response_model=StudentOut)
+def get_student(student_id: int, db: SessionDep):
+    student = db.get(Student, student_id)
+    if student is None:
+        raise services.ServiceError("STUDENT_NOT_FOUND", "Student not found")
+    return student
+
+
+@app.get(
+    "/students/{student_id}/enrollments",
+    response_model=list[EnrollmentDetail],
+)
+def list_student_enrollments(student_id: int, db: SessionDep):
+    stmt = enrollment_details().where(Enrollment.student_id == student_id)
     return db.execute(stmt).all()
 
 
@@ -210,10 +148,6 @@ def course_stats(db: SessionDep):
         )
         .outerjoin(Course.enrollments)
         .group_by(Course.id)
-        .order_by(
-            func.count(Enrollment.id).desc(),
-            Course.id,
-        )
+        .order_by(func.count(Enrollment.id).desc(), Course.id)
     )
-
     return db.execute(stmt).all()
