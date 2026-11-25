@@ -1,5 +1,8 @@
 from typing import Annotated
 
+import auth
+from auth import CurrentUser
+
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
@@ -19,6 +22,7 @@ from schemas import (
     EnrollmentOut,
     StudentIn,
     StudentOut,
+    UserOut
 )
 
 
@@ -35,12 +39,18 @@ app.add_middleware(
 )
 
 SessionDep = Annotated[Session, Depends(get_db)]
+
+app.include_router(auth.router)
 app.include_router(graphql_app, prefix="/graphql")
 
 
 @app.get("/")
 def root():
     return {"message": "Course Catalog API is running"}
+
+@app.get("/me", response_model=UserOut)
+def read_me(user: CurrentUser):
+    return user
 
 
 def pagination(page: int = 1, page_size: int = 20) -> dict[str, int]:
