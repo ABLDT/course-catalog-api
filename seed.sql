@@ -1,6 +1,8 @@
--- seed.sql: initial data
--- For the training database only!
-TRUNCATE enrollments, students, courses RESTART IDENTITY;
+-- seed.sql: starting data (the courses are taken from data.py of Labs 4 and 5)
+-- The file can be run again: it first clears the tables (including users).
+-- For the teaching database only! The users are created by seed_users.py.
+
+TRUNCATE users, enrollments, students, courses RESTART IDENTITY;
 
 INSERT INTO courses (
     id, title, description, credits, is_elective, likes, level
