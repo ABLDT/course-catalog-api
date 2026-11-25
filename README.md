@@ -1,167 +1,154 @@
 # course-catalog-api
 
-Backend of the course catalog: FastAPI, SQLAlchemy 2.1, PostgreSQL, Alembic and GraphQL on Strawberry as a second entrance (Labs 4–8, Advanced Web Technologies).
+Backend for the course catalog: FastAPI, SQLAlchemy, PostgreSQL, Alembic, Strawberry GraphQL, and JWT authentication with roles (Advanced Web Technologies, Labs 4–9). The Next.js frontend is maintained in the separate `course-catalog` repository.
 
 ## How to run
 
-You need Python 3.11+ and PostgreSQL 16+.
+Requirements: Python 3.11+, PostgreSQL 16+, and Node.js for the frontend.
 
-Create the role and database once as the `postgres` superuser:
+For a new local installation, create the database role and database once as the PostgreSQL superuser. Replace the example password with your own local password.
 
 ```sql
 CREATE ROLE catalog_app LOGIN PASSWORD 'change-me';
 CREATE DATABASE course_catalog OWNER catalog_app;
 ```
 
-From the project folder on Windows PowerShell:
+From the backend project directory in Windows PowerShell:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 Copy-Item .env.example .env
-alembic upgrade head
-& "C:\Program Files\PostgreSQL\16\bin\psql.exe" -h localhost -U catalog_app -d course_catalog -v ON_ERROR_STOP=1 -f seed.sql
-fastapi dev main.py
 ```
 
-REST docs: `http://localhost:8000/docs`  
-GraphiQL: `http://localhost:8000/graphql`
-
-The password `change-me` is only for the training project. Real secrets must not be committed.
-
-Useful checks while the server is running:
+Set `DATABASE_URL` in `.env` to match the local database credentials. Generate a random signing key with the following command and set `SECRET_KEY` in `.env` to the generated value. Do not publish the key or the `.env` file. The application requires a key of at least 32 characters.
 
 ```powershell
-python try_errors.py
-python try_graphql.py
-python try_n_plus_1.py
-python try_protection.py
-python flood_likes.py
-python measure.py
+python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-Expected core results on the starting data:
+Keep `GRAPHQL_INTROSPECTION=true` for the local GraphiQL interface. Then initialize the database and start the API:
 
-```text
-try_errors.py     -> 5 of 5 as expected
-try_graphql.py    -> 8 of 8 as expected
-try_n_plus_1.py   -> 3 SQL queries and 3 SQL queries
-measure.py        -> REST: 5 requests, 2 rounds, 5 SQL queries
-                     GraphQL: 1 request, 1 round, 3 SQL queries
+```powershell
+alembic upgrade head
+& "C:\Program Files\PostgreSQL\16\bin\psql.exe" -h localhost -U catalog_app -d course_catalog -v ON_ERROR_STOP=1 -f seed.sql
+python seed_users.py
+alembic check
+uvicorn main:app --reload
 ```
 
-The byte counts printed by `measure.py` must be copied from the actual local run because they depend on the exact response data.
+`seed.sql` resets the demo data, including the users table. Always run `seed_users.py` after it. Do not use this reset procedure on a database containing important data.
 
-## What changed in the API
+REST documentation: http://localhost:8000/docs. GraphiQL: http://localhost:8000/graphql.
 
-- Application rules were moved to `services.py`. The services layer knows the database rules but does not know HTTP or GraphQL.
-- REST translates `ServiceError` into RFC 9457 Problem Details in `problem.py`. Rule errors use `application/problem+json`, a stable `type`, HTTP status, title, detail and instance.
-- GraphQL is available at `/graphql` alongside REST. GraphiQL is available through a browser while introspection is enabled.
-- The GraphQL schema contains `Course`, `Student` and `Enrollment` types and the `courses`, `course`, `students`, `student` and `enrollments` queries.
-- `enroll` and `likeCourse` mutations use the same services as REST. Expected rule failures are returned in `userErrors`; unexpected GraphQL execution failures remain in `errors`.
-- Every HTTP response gets an `X-SQL-Queries` header. It is used to expose N+1 behavior and to verify the DataLoader optimization.
-- DataLoaders are created per GraphQL request and batch relation loads by key. The nested queries use three SQL queries instead of a number that grows with the amount of data.
-- GraphQL protection limits query depth to 5 and aliases to 10, validates `limit` and student IDs, masks unexpected internal exceptions, and controls introspection through `GRAPHQL_INTROSPECTION`.
-- REST now also has `GET /students/{id}` and `GET /students/{id}/enrollments` for the REST version of the My courses page.
+Demo accounts (local course fixtures only; never use these passwords in production):
 
-## Example queries
+| E-mail | Role | Password |
+|---|---|---|
+| admin@example.com | admin | admin-demo-password |
+| aigerim@example.com | student (student 1) | aigerim-demo-pass |
+| daniyar@example.com | student (student 2) | daniyar-demo-pass |
+| asel@example.com | student (student 3) | asel-demo-password |
 
-The My courses query (Variables: `{"id": "2"}`):
+The account e-mail and the linked student profile e-mail are separate fields. In my seed data, student 2 is Daulet and student 3 is Arman.
 
-```graphql
-query MyCourses($id: ID!) {
-  student(id: $id) {
-    name
-    enrollments {
-      id
-      course {
-        title
-        credits
-        level
-      }
-    }
-  }
-}
-```
+For the frontend, in the `course-catalog` directory, run `npm install`, set `API_URL=http://localhost:8000` and `NEXT_PUBLIC_API_URL=http://localhost:8000` in `.env.local`, and run `npm run dev`. Open http://localhost:3000/login or http://localhost:3000/account. The session cookie is HttpOnly, Secure and SameSite=Lax, with path `/` and a configured lifetime of 900 seconds.
 
-Successful enrollment mutation:
+### Verification results
 
-```graphql
-mutation Enroll($input: EnrollInput!) {
-  enroll(input: $input) {
-    enrollment {
-      id
-      enrolledAt
-      course { title }
-    }
-    userErrors { code message }
-  }
-}
-```
+The local database was dropped and recreated, all three Alembic migrations (0001–0003) were applied from scratch, and the seed scripts restored 6 courses, 3 students, 6 enrollments and 4 users. The final test suite was then rerun successfully. The GraphQL protection checks were also verified before the database rebuild.
 
-Variables:
+| Script or check | Observed result |
+|---|---|
+| `check_users.py` | 4/4 |
+| `try_auth.py` | 6/6 |
+| `try_tokens.py` | 9/9 |
+| `try_timing.py` | 40 requests per case; unknown e-mail median 40.3 ms, known e-mail median 40.2 ms |
+| `try_access.py` | 14/14 |
+| `try_errors.py` | 5/5 |
+| `try_graphql_access.py` | 9/9 |
+| `try_graphql.py` | 8/8 |
+| `try_n_plus_1.py` | 3 student rows and 6 enrollment rows; 4 SQL queries for each request |
+| `try_protection.py` | Depth, alias and argument limits work; unexpected errors are masked; introspection enabled |
+| `measure.py` | REST: 5 requests, 2 rounds, 1116 bytes, 5 SQL queries; GraphQL: 1 request, 1 round, 332 bytes, 3 SQL queries |
+| `scan_routes.py` | 11 routes checked, 8 open without a token |
+| `scan_graphql.py` | 11 fields checked, 8 open without a token |
+| `alembic current` | 0003 (head) |
+| `alembic check` | No new upgrade operations detected |
 
-```json
-{"input":{"courseId":"web-security","studentId":"3"}}
-```
+All 55 checks in the seven counted test scripts passed again after the clean database rebuild. The additional SQL query in the authenticated N+1 tests is the user lookup, not a regression in DataLoader batching. The measurement script uses unauthenticated public reads, so its GraphQL request still uses three SQL queries.
 
-A repeated enrollment is an expected rule error and therefore remains inside `data`:
+## Access matrix
 
-```json
-{
-  "data": {
-    "enroll": {
-      "enrollment": null,
-      "userErrors": [
-        {
-          "code": "ALREADY_ENROLLED",
-          "message": "Student is already enrolled in this course"
-        }
-      ]
-    }
-  }
-}
-```
+Actual results from `try_access.py` (14 of 14 as expected). The administrator has no linked student profile, so the self-enrollment case is not applicable.
 
-## REST vs GraphQL comparison
+| Request | Anonymous | Student | Admin |
+|---|---:|---:|---:|
+| GET /courses | 200 | 200 | 200 |
+| GET /me | 401 | 200 | 200 |
+| GET /enrollments | 401 | 403 | 200 |
+| POST /enrollments, for yourself | 401 | 201 | — |
+| POST /enrollments, for another | 401 | 403 | 201 |
 
-The My courses screen of student 2, starting data.
+GraphQL access checks passed 9/9. The public course catalog is available without login; `me` requires authentication, `students` requires the admin role, and `Student.email` is restricted to the owner or admin. An unauthorized nullable field returns null with an error. An invalid bearer token is rejected with HTTP 401 before GraphQL execution.
 
-| Criterion | REST | GraphQL | Source |
+## Open spots
+
+The following 16 entries were reported open by the two local scanners. These are observations of the lab's current scope, not a claim that all open entries are security defects. The proposed access rules are design recommendations for the final project and have not been implemented in this lab.
+
+| Route or field | Verdict | How to close it |
+|---|---|---|
+| `GET /` | Public service status by design | Keep public; return no sensitive details |
+| `GET /courses` | Public catalog by design | No change needed |
+| `GET /courses/{course_id}` | Public course details by design | No change needed |
+| `POST /courses/{course_id}/like` | Unrestricted modification of the like counter | Require authentication and enforce a per-user like rule |
+| `POST /students` | Unrestricted profile creation | Restrict profile creation to an approved registration workflow or admin |
+| `GET /students/{student_id}` | Student profile privacy concern | Require owner or admin access to private profile data |
+| `GET /students/{student_id}/enrollments` | Enrollment privacy concern | Require owner or admin access |
+| `GET /stats/courses` | Public aggregate statistics if approved | Keep public only if the final specification permits it |
+| GraphQL `Query.courses` | Public catalog by design | No change needed |
+| GraphQL `Query.course` | Public course details by design | No change needed |
+| GraphQL `Query.student` | Student identity and profile privacy concern | Apply the final profile access policy; keep sensitive fields protected |
+| GraphQL `Query.enrollments` | Enrollment privacy concern | Restrict the full list to admin |
+| GraphQL `Course.enrollments` | Enrollment relationship privacy concern | Restrict access or return only permitted records |
+| GraphQL `Student.enrollments` | Enrollment relationship privacy concern | Require owner or admin access |
+| GraphQL `Mutation.enroll` | Inconsistent access policy with REST | Enforce the same authenticated owner/admin rule in the shared business layer |
+| GraphQL `Mutation.likeCourse` | Unrestricted modification of the like counter | Enforce the same authenticated per-user rule as REST |
+
+## Threat table
+
+| Where | What can break | How it is covered | How I checked |
 |---|---|---|---|
-| Requests and rounds per screen | 5 requests, 2 rounds | 1 request, 1 round | `measure.py` |
-| Bytes in the responses | 1116 bytes | 332 bytes | `measure.py` |
-| SQL queries per screen | 5 | 3 | `measure.py`, `X-SQL-Queries` |
-| SQL growth with more students | The REST page grows with the number of course requests | After DataLoaders the nested GraphQL checks stay at 3 SQL queries for both 3 and 20 students | `try_n_plus_1.py`, experiments 4–5 |
-| Error in query text | REST usually uses HTTP 4xx/422 for route/parameter problems | Usually HTTP 200 with an `errors` key and possibly `data: null` | experiments 1 and 8 |
-| Expected rule error | e.g. repeated enrollment -> `409 application/problem+json` | HTTP 200, `userErrors[0].code = ALREADY_ENROLLED` | steps 1 and 4 |
-| HTTP cache | Natural fit for cacheable GET resources and standard HTTP cache semantics | Usually POST to one endpoint, so HTTP caching is less direct and often needs application/client tooling | lecture comparison |
-| Protection from expensive queries | Cost is mostly fixed by each route implementation | Explicit depth, alias and argument limits are required because the client chooses query shape | experiments 6–7 |
+| The login form | Account enumeration and password guessing | Generic login error, dummy password hash verification for unknown accounts; login rate limiting is not implemented | `try_auth.py`: 6/6; final timing check: 40.3 ms vs 40.2 ms median |
+| Passwords and the key | Plaintext password storage or weak signing key | Argon2id password hashes; required secret with minimum length of 32 characters; secrets belong in local environment files | `check_users.py`: 4/4; missing and short keys rejected; two hashes of the same password differed |
+| Token and role | Invalid tokens or stale permissions | Token signature and claims are validated; current user and role loaded from the database | `try_tokens.py`: 9/9; role changes immediately affected access in experiment 4 |
+| Permissions on objects | Access to another student's records | REST role and owner checks; GraphQL permissions on selected queries and the email field | `try_access.py`: 14/14; `try_graphql_access.py`: 9/9; remaining gaps documented above |
+| Cookie and Next.js | Exposure of the session to client-side scripts or invalid sessions accepted | HttpOnly, Secure, SameSite=Lax; server-only session helpers; DAL verifies the session through FastAPI | DevTools confirmed the flags; `document.cookie` did not show `session`; an invalid session resulted in 307 redirect and API 401 |
+| Logout and lifetime | Session credentials remain valid longer than intended | Cookie removed at logout; JWT has a 15-minute lifetime | Cookie disappearance confirmed; JWT claim interval was 900 seconds; direct post-logout token validity check not yet performed |
 
-**Conclusion.** For simple resource-oriented screens with a stable response shape, REST remains straightforward and works naturally with HTTP semantics. For My courses, GraphQL is a better fit because one request returns exactly the nested fields needed instead of five requests in two rounds. With DataLoaders, the GraphQL version also keeps the database work at three SQL queries. GraphQL flexibility requires additional query protections and careful client-side checking of the `errors` key.
+Deliberately not closed:
+
+- Login rate limiting: a shared store such as Redis can maintain short-lived counters across API workers. Combining account and source-based limits avoids relying on a single e-mail counter and reduces the risk of abusive account lockouts.
+- Immediate JWT revocation at logout: a server-side revocation list or token-version mechanism could invalidate credentials before expiration, at the cost of shared state and an additional lookup. Currently logout removes the browser session, but does not guarantee immediate server-side token revocation.
 
 ## Experiment log
 
-| # | Experiment | What I saw | Cause | How I fixed it |
+| No. | Experiment | What I saw | Cause | How I fixed it |
 |---|---|---|---|---|
-| 1 | Typo `titel` and argument name in `snake_case` | HTTP status stayed 200, `data` was null, and `errors` contained `Cannot query field 'titel'...` / `Unknown argument 'is_elective'... Did you mean 'isElective'?` | GraphQL validates the query text against the schema before resolver execution, and Strawberry exposes camelCase names | Corrected `titel` to `title` and used `isElective` |
-| 2 | Removed `| None` from `course` and queried a missing course | `Cannot return null for non-nullable field Query.course.`; with two aliases the error propagated and the whole `data` became null | The schema promised that `course` could never be null, but the resolver can return no row | Restored `CourseType | None` |
-| 3 | Sent a mutation with GET | The read query over GET returned 200, but the mutation returned `400 Bad Request: mutations are not allowed when using GET` | GET is defined as safe; mutations change state and must not be executed through GET | Sent mutations through POST |
-| 4 | Added 17 students and measured lazy-loaded nested queries | Starting data: 7 and 7 SQL queries. With 20 students: 27 and 24 | Lazy loading executes relation queries per parent object, so database work grows although the client still sends one POST | Replaced lazy relation loading with per-request DataLoaders |
-| 5 | Replaced the batch function with a naive result list | One query failed loudly with `WrongNumberOfResultsReturned`; another returned the wrong course for several enrollments without an error | A DataLoader must return exactly one result slot per key and preserve key order. DB row order is not the key order | Grouped rows by key and rebuilt the result list in the original key order |
-| 6 | Six dangerous queries before and after protection | Before: depth and aliases executed; DB/Value errors leaked. After: depth >5 and aliases >10 were rejected, bad limit/ID got safe messages, unexpected DB overflow became `Unexpected error.`; `flood_likes.py` used 0 SQL queries | Unprotected GraphQL lets the client choose expensive/deep query shapes and can expose internals | Added argument checks, `QueryDepthLimiter`, `MaxAliasesLimiter` and `MaskErrors` |
-| 7 | Disabled introspection, then made a typo | `__schema` was rejected, ordinary queries still worked, and `Did you mean 'course' or 'courses'?` still exposed field hints | Disabling introspection hides the schema map but is not authorization and does not hide every field name | Restored `GRAPHQL_INTROSPECTION=true` for development; authorization must protect data, not schema secrecy |
-| 8 | Frontend typo, removed GraphQL `errors` check, then stopped API | With the check: `GraphQLRequestError` named the bad field. Without it: only a null destructuring `TypeError` appeared. With API stopped: `fetch failed` | GraphQL application/query errors often use HTTP 200; network errors have no GraphQL body at all | `gql()` checks HTTP status and the GraphQL `errors` key and throws `GraphQLRequestError`; restored files after the experiment |
+| 1 | Secret key validation and Argon2id hashes | Missing key: Field required. Short key: minimum 32 characters. Two hashes of one password differed; correct password verified, wrong password did not. | Settings validation and independent random salts. | Set a valid local secret and restored the normal environment. |
+| 2 | Login timing with and without the dummy hash | Initial protected: unknown 40.1 ms, known 39.8 ms. Without defense: 3.1 ms vs 40.7 ms. Restored: 40.4 ms vs 40.5 ms. Final clean-start run: 40.3 ms vs 40.2 ms. Each case used 40 requests. | Password verification work explains the timing difference. | Restored the original login logic; `try_auth.py` passed 6/6. |
+| 3 | Token validation | Normal configuration: 9/9. Temporary experimental configuration: 3/9. Restored: 9/9. | Token authenticity and claims must be verified before trusting the user identity. | Restored `security.py` and reran the test. |
+| 4 | Role changes with the same token | Admin → student → admin: 200, 403, 200. Student → admin → student: 403, 200, 403. | Role is read from the database on each authenticated request. | Restored both original roles. |
+| 5 | Object-level authorization | Access matrix changed from 14/14 to 13/14 in the temporary experiment. A test enrollment (ID 20) was created and confirmed in PostgreSQL. | Authentication alone does not enforce ownership. | Removed the test enrollment, restored `main.py`, and obtained 14/14 again. Database count returned to 6 enrollments. |
+| 6 | Field permissions and nullable behavior | Part B: non-nullable protected email caused 7/9; restored nullable field gave 9/9 and `2 shown, 2 hidden`. Part A was not separately performed. | A non-nullable field error propagates to its parent. Field-level permissions apply regardless of the query path. | Restored `email: str \| None` with its permission class. |
+| 7 | Invalid session cookie and server-side verification | Without a cookie: 307 to `/login`. Invalid session cookie: 307 to `/login`; API `/me`: 401. Valid session: API 200. The second experimental configuration was not separately performed. | Cookie presence is only an optimistic check; the API validates the token. | Kept `verifySession()` in the account page; no temporary code change was needed for the completed checks. |
+| 8 | Token after logout | Logout deleted the `session` cookie and returned to the login page. The 900-second JWT lifetime was confirmed earlier. Direct post-logout token verification remains untested. | Browser cookie deletion is different from server-side token revocation. | No revocation mechanism was added in this lab; document the limitation. |
 
 ## Decisions
 
-**Why are rules and their errors in `services.py` instead of being checked independently in REST and GraphQL?**  
-The rule must have one source of truth. `services.py` produces a protocol-independent code such as `ALREADY_ENROLLED`; REST converts it to 409 Problem Details while GraphQL converts the same code to `userErrors`. Duplicating the rule in both interfaces would allow the behavior to drift.
+**Why read the role from the database?** It costs an extra SQL query per authenticated request, but permission changes take effect immediately. Experiment 4 demonstrated both role changes with unchanged tokens.
 
-**Why are DataLoaders created in `Context` per request, and why does the batch function match rows to keys by value?**  
-A DataLoader caches values, so a process-global loader could leak stale or another request's data. A per-request loader keeps batching and caching scoped to one request. Database row order is not guaranteed to equal key order, so rows are grouped by key and results are reconstructed in the original keys order.
+**Why protect a nullable GraphQL field?** Field-level authorization applies regardless of which query reaches the field. Allowing null preserves permitted data when access to the email is denied; experiment 6 showed that a non-nullable field can cause otherwise permitted parent data to disappear.
 
-**Why do `check_limit` and `parse_id` coexist with `MaskErrors`?**  
-Expected client mistakes deserve precise messages such as `Invalid ID: 'abc'` or `limit must be between 1 and 100`; these messages help the client fix the request. `MaskErrors` is the second layer for unforeseen implementation/database exceptions, where exposing the original text could leak internals.
-
+**Why are both proxy and verifySession needed?** The proxy gives a quick redirect when a cookie is absent, but presence alone does not establish a valid identity. The DAL asks the API to validate the session before returning account data. The invalid-session test confirmed the API's 401 and the frontend redirect.
