@@ -15,12 +15,14 @@ from strawberry.extensions import (
     QueryDepthLimiter,
 )
 from strawberry.fastapi import BaseContext, GraphQLRouter
+from strawberry.permission import BasePermission
 from strawberry.types import Info
 
 import services
+from auth import can_access_student, get_optional_user
 from config import settings
 from db import get_db
-from models import Course, Enrollment, Student
+from models import Course, Enrollment, Student, User
 
 
 def check_limit(limit: int) -> int:
@@ -37,44 +39,96 @@ def parse_id(value: strawberry.ID) -> int:
 
 
 def should_mask(error: GraphQLError) -> bool:
-    """Hide unexpected exceptions; our GraphQLError and query errors stay visible."""
+    """Hide unexpected exceptions."""
     original = error.original_error
     return original is not None and not isinstance(original, GraphQLError)
 
 
+# GraphQL permissions
+
+class IsAuthenticated(BasePermission):
+    message = "Authentication required"
+
+    def has_permission(self, source, info: Info, **kwargs) -> bool:
+        return info.context.user is not None
+
+
+class IsAdmin(BasePermission):
+    message = "Admin role required"
+
+    def has_permission(self, source, info: Info, **kwargs) -> bool:
+        user = info.context.user
+        return user is not None and user.role == "admin"
+
+
+class IsSelfOrAdmin(BasePermission):
+    message = "Not allowed to read this field"
+
+    def has_permission(self, source, info: Info, **kwargs) -> bool:
+        user = info.context.user
+        return user is not None and can_access_student(
+            user, int(source.id)
+        )
+
+
+# DataLoader
+
 def batch_loader(db: Session, column, many: bool = False) -> DataLoader:
-    """Gathers keys in one pass and loads all rows with a single IN (...) query."""
+    """Load all requested rows with a single IN query."""
     model = column.class_
 
     async def load(keys: list) -> list:
-        rows = db.scalars(select(model).where(column.in_(keys))).all()
+        rows = db.scalars(
+            select(model).where(column.in_(keys))
+        ).all()
+
         groups = defaultdict(list)
+
         for row in rows:
             groups[getattr(row, column.key)].append(row)
 
         if many:
             return [groups[key] for key in keys]
 
-        return [groups[key][0] if groups[key] else None for key in keys]
+        return [
+            groups[key][0] if groups[key] else None
+            for key in keys
+        ]
 
     return DataLoader(load_fn=load)
 
 
-class Context(BaseContext):
-    """Created per request: the session and loaders don't outlive the request."""
+# Context
 
-    def __init__(self, db: Session):
+class Context(BaseContext):
+    """Session, current user and loaders for one request."""
+
+    def __init__(self, db: Session, user: User | None):
         super().__init__()
+
         self.db = db
+        self.user = user
+
         self.course = batch_loader(db, Course.id)
         self.student = batch_loader(db, Student.id)
-        self.enrollments_of_course = batch_loader(db, Enrollment.course_id, many=True)
-        self.enrollments_of_student = batch_loader(db, Enrollment.student_id, many=True)
+
+        self.enrollments_of_course = batch_loader(
+            db, Enrollment.course_id, many=True
+        )
+
+        self.enrollments_of_student = batch_loader(
+            db, Enrollment.student_id, many=True
+        )
 
 
-def get_context(db: Annotated[Session, Depends(get_db)]) -> Context:
-    return Context(db)
+def get_context(
+    db: Annotated[Session, Depends(get_db)],
+    user: Annotated[User | None, Depends(get_optional_user)],
+) -> Context:
+    return Context(db, user)
 
+
+# GraphQL types
 
 @strawberry.type(name="Course")
 class CourseType:
@@ -87,25 +141,44 @@ class CourseType:
     level: str
 
     @strawberry.field
-    async def enrollments(self, info: Info) -> list["EnrollmentType"]:
-        return await info.context.enrollments_of_course.load(self.id)
+    async def enrollments(
+        self, info: Info
+    ) -> list["EnrollmentType"]:
+        return await info.context.enrollments_of_course.load(
+            self.id
+        )
+
+
+@strawberry.type(name="User")
+class UserType:
+    id: strawberry.ID
+    email: str
+    role: str
 
 
 @strawberry.type(name="Student")
 class StudentType:
     id: strawberry.ID
     name: str
-    email: str
+
+    email: str | None = strawberry.field(
+        permission_classes=[IsSelfOrAdmin]
+    )
 
     @strawberry.field
-    async def enrollments(self, info: Info) -> list["EnrollmentType"]:
-        return await info.context.enrollments_of_student.load(int(self.id))
+    async def enrollments(
+        self, info: Info
+    ) -> list["EnrollmentType"]:
+        return await info.context.enrollments_of_student.load(
+            int(self.id)
+        )
 
 
 @strawberry.type(name="Enrollment")
 class EnrollmentType:
     id: strawberry.ID
     enrolled_at: datetime
+
     course_id: strawberry.Private[str]
     student_id: strawberry.Private[int]
 
@@ -118,8 +191,11 @@ class EnrollmentType:
         return await info.context.student.load(self.student_id)
 
 
+# Queries
+
 @strawberry.type
 class Query:
+
     @strawberry.field
     def courses(
         self,
@@ -127,29 +203,64 @@ class Query:
         is_elective: bool | None = None,
         limit: int = 20,
     ) -> list[CourseType]:
-        stmt = select(Course).order_by(Course.likes.desc(), Course.id).limit(check_limit(limit))
+
+        stmt = (
+            select(Course)
+            .order_by(Course.likes.desc(), Course.id)
+            .limit(check_limit(limit))
+        )
+
         if is_elective is not None:
-            stmt = stmt.where(Course.is_elective == is_elective)
+            stmt = stmt.where(
+                Course.is_elective == is_elective
+            )
+
         return info.context.db.scalars(stmt).all()
 
+    @strawberry.field(permission_classes=[IsAuthenticated])
+    def me(self, info: Info) -> UserType:
+        return info.context.user
+
     @strawberry.field
-    def course(self, info: Info, id: strawberry.ID) -> CourseType | None:
+    def course(
+        self, info: Info, id: strawberry.ID
+    ) -> CourseType | None:
         return info.context.db.get(Course, id)
 
-    @strawberry.field
-    def students(self, info: Info, limit: int = 20) -> list[StudentType]:
-        stmt = select(Student).order_by(Student.id).limit(check_limit(limit))
+    @strawberry.field(permission_classes=[IsAdmin])
+    def students(
+        self, info: Info, limit: int = 20
+    ) -> list[StudentType]:
+
+        stmt = (
+            select(Student)
+            .order_by(Student.id)
+            .limit(check_limit(limit))
+        )
+
         return info.context.db.scalars(stmt).all()
 
     @strawberry.field
-    def student(self, info: Info, id: strawberry.ID) -> StudentType | None:
+    def student(
+        self, info: Info, id: strawberry.ID
+    ) -> StudentType | None:
         return info.context.db.get(Student, parse_id(id))
 
     @strawberry.field
-    def enrollments(self, info: Info, limit: int = 20) -> list[EnrollmentType]:
-        stmt = select(Enrollment).order_by(Enrollment.id).limit(check_limit(limit))
+    def enrollments(
+        self, info: Info, limit: int = 20
+    ) -> list[EnrollmentType]:
+
+        stmt = (
+            select(Enrollment)
+            .order_by(Enrollment.id)
+            .limit(check_limit(limit))
+        )
+
         return info.context.db.scalars(stmt).all()
 
+
+# Mutation types
 
 @strawberry.type
 class UserError:
@@ -166,49 +277,89 @@ class EnrollInput:
 @strawberry.type
 class EnrollPayload:
     enrollment: EnrollmentType | None = None
-    user_errors: list[UserError] = strawberry.field(default_factory=list)
+    user_errors: list[UserError] = strawberry.field(
+        default_factory=list
+    )
 
 
 @strawberry.type
 class LikePayload:
     course: CourseType | None = None
-    user_errors: list[UserError] = strawberry.field(default_factory=list)
+    user_errors: list[UserError] = strawberry.field(
+        default_factory=list
+    )
 
 
 def as_user_errors(err: services.ServiceError) -> list[UserError]:
-    return [UserError(code=err.code, message=err.message)]
+    return [
+        UserError(
+            code=err.code,
+            message=err.message,
+        )
+    ]
 
+
+# Mutations
 
 @strawberry.type
 class Mutation:
+
     @strawberry.mutation
-    def enroll(self, info: Info, input: EnrollInput) -> EnrollPayload:
+    def enroll(
+        self, info: Info, input: EnrollInput
+    ) -> EnrollPayload:
+
         try:
             enrollment = services.enroll(
                 info.context.db,
                 str(input.course_id),
                 parse_id(input.student_id),
             )
+
         except services.ServiceError as err:
-            return EnrollPayload(user_errors=as_user_errors(err))
+            return EnrollPayload(
+                user_errors=as_user_errors(err)
+            )
+
         return EnrollPayload(enrollment=enrollment)
 
     @strawberry.mutation
-    def like_course(self, info: Info, id: strawberry.ID) -> LikePayload:
+    def like_course(
+        self, info: Info, id: strawberry.ID
+    ) -> LikePayload:
+
         try:
-            course = services.like_course(info.context.db, str(id))
+            course = services.like_course(
+                info.context.db, str(id)
+            )
+
         except services.ServiceError as err:
-            return LikePayload(user_errors=as_user_errors(err))
+            return LikePayload(
+                user_errors=as_user_errors(err)
+            )
+
         return LikePayload(course=course)
 
+
+# GraphQL protections
 
 extensions = [
     QueryDepthLimiter(max_depth=5),
     MaxAliasesLimiter(max_alias_count=10),
     MaskErrors(should_mask_error=should_mask),
 ]
+
 if not settings.graphql_introspection:
     extensions.append(DisableIntrospection())
 
-schema = strawberry.Schema(query=Query, mutation=Mutation, extensions=extensions)
-graphql_app = GraphQLRouter(schema, context_getter=get_context)
+
+schema = strawberry.Schema(
+    query=Query,
+    mutation=Mutation,
+    extensions=extensions,
+)
+
+graphql_app = GraphQLRouter(
+    schema,
+    context_getter=get_context,
+)
